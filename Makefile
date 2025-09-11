@@ -24,4 +24,10 @@ lint:
 	cargo clean
 	uv run --extra dev pre-commit run --files python/**/**/**.py
 
+rust-publish:
+	cargo publish
 
+npm-publish:
+	npm login
+	cd docs/pkg
+	npm publish --access public
