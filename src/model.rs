@@ -54,6 +54,7 @@ impl BaseModel {
 pub struct ColBERT {
     pub(crate) model: BaseModel,
     pub(crate) linear: Linear,
+    pub(crate) linear2: Option<Linear>,
     pub(crate) tokenizer: Tokenizer,
     pub(crate) mask_token_id: u32,
     pub(crate) mask_token: String,
@@ -74,9 +75,11 @@ impl ColBERT {
     pub fn new(
         weights: Vec<u8>,
         dense_weights: Vec<u8>,
+        dense2_weights: Option<Vec<u8>>,
         tokenizer_bytes: Vec<u8>,
         config_bytes: Vec<u8>,
         dense_config_bytes: Vec<u8>,
+        dense2_config_bytes: Option<Vec<u8>>,
         query_prefix: String,
         document_prefix: String,
         mask_token: String,
@@ -143,6 +146,42 @@ impl ColBERT {
 
         let linear = candle_nn::linear_no_bias(in_features, out_features, dense_vb.pp("linear"))?;
 
+        // Load optional 2_Dense layer if present
+        let linear2 = if let (Some(weights2), Some(config2)) = (dense2_weights, dense2_config_bytes)
+        {
+            let dense2_vb = VarBuilder::from_buffered_safetensors(weights2, DType::F32, device)?;
+            let dense2_config: serde_json::Value = serde_json::from_slice(&config2)?;
+
+            let in_features2 = dense2_config["in_features"]
+                .as_u64()
+                .map(|v| v as usize)
+                .ok_or_else(|| {
+                    ColbertError::Operation("Missing 'in_features' in 2_Dense config".into())
+                })?;
+            let out_features2 = dense2_config["out_features"]
+                .as_u64()
+                .map(|v| v as usize)
+                .ok_or_else(|| {
+                    ColbertError::Operation("Missing 'out_features' in 2_Dense config".into())
+                })?;
+
+            // Validate that output of 1_Dense matches input of 2_Dense
+            if out_features != in_features2 {
+                return Err(ColbertError::Operation(format!(
+                    "Dimension mismatch: 1_Dense output ({}) != 2_Dense input ({})",
+                    out_features, in_features2
+                )));
+            }
+
+            Some(candle_nn::linear_no_bias(
+                in_features2,
+                out_features2,
+                dense2_vb.pp("linear"),
+            )?)
+        } else {
+            None
+        };
+
         // If do_query_expansion is false, attend_to_expansion_tokens should also be false
         let final_attend_to_expansion_tokens = if !do_query_expansion {
             false
@@ -153,6 +192,7 @@ impl ColBERT {
         Ok(Self {
             model,
             linear,
+            linear2,
             tokenizer,
             mask_token_id,
             mask_token: mask_token,
@@ -268,7 +308,14 @@ impl ColBERT {
                         let token_embeddings =
                             self.model
                                 .forward(&token_ids, &attention_mask, &token_type_ids)?;
-                        let projected_embeddings = self.linear.forward(&token_embeddings)?;
+
+                        // Apply 1_Dense
+                        let mut projected_embeddings = self.linear.forward(&token_embeddings)?;
+
+                        // Apply 2_Dense if present
+                        if let Some(ref linear2) = self.linear2 {
+                            projected_embeddings = linear2.forward(&projected_embeddings)?;
+                        }
 
                         if !self.do_query_expansion || !is_query {
                             // Apply filtering, normalization, and padding.
@@ -298,7 +345,13 @@ impl ColBERT {
                 self.model
                     .forward(&token_ids, &attention_mask, &token_type_ids)?;
 
-            let projected_embeddings = self.linear.forward(&token_embeddings)?;
+            // Apply 1_Dense
+            let mut projected_embeddings = self.linear.forward(&token_embeddings)?;
+
+            // Apply 2_Dense if present
+            if let Some(ref linear2) = self.linear2 {
+                projected_embeddings = linear2.forward(&projected_embeddings)?;
+            }
 
             let final_embeddings = if !self.do_query_expansion || !is_query {
                 // Apply filtering, normalization, and padding.

@@ -2,7 +2,7 @@ use crate::{
     error::ColbertError,
     model::ColBERT,
     pooling::hierarchical_pooling,
-    types::{EncodeInput, EncodeOutput, RawSimilarityOutput, SimilarityInput},
+    types::{EncodeInput, EncodeOutput, RawSimilarityOutput, SimilarityInput, Similarities},
 };
 use candle_core::{Device, IndexOp, Tensor};
 use wasm_bindgen::prelude::*;
@@ -14,14 +14,36 @@ impl ColBERT {
     pub fn from_bytes(
         weights: Vec<u8>,
         dense_weights: Vec<u8>,
+        dense2_weights: JsValue,
         tokenizer: Vec<u8>,
         config: Vec<u8>,
         sentence_transformers_config: Vec<u8>,
         dense_config: Vec<u8>,
+        dense2_config: JsValue,
         special_tokens_map: Vec<u8>,
         batch_size: Option<usize>,
     ) -> Result<ColBERT, JsValue> {
         console_error_panic_hook::set_once();
+
+        // Convert optional 2_Dense weights from JsValue
+        let dense2_weights_opt: Option<Vec<u8>> =
+            if dense2_weights.is_null() || dense2_weights.is_undefined() {
+                None
+            } else {
+                Some(serde_wasm_bindgen::from_value(dense2_weights).map_err(|e| {
+                    JsValue::from_str(&format!("Failed to parse dense2_weights: {}", e))
+                })?)
+            };
+
+        // Convert optional 2_Dense config from JsValue
+        let dense2_config_opt: Option<Vec<u8>> =
+            if dense2_config.is_null() || dense2_config.is_undefined() {
+                None
+            } else {
+                Some(serde_wasm_bindgen::from_value(dense2_config).map_err(|e| {
+                    JsValue::from_str(&format!("Failed to parse dense2_config: {}", e))
+                })?)
+            };
 
         let st_config: serde_json::Value =
             serde_json::from_slice(&sentence_transformers_config).map_err(ColbertError::from)?;
@@ -37,9 +59,7 @@ impl ColBERT {
             .as_str()
             .unwrap_or("[D]")
             .to_string();
-        let do_query_expansion = st_config["do_query_expansion"]
-            .as_bool()
-            .unwrap_or(true);
+        let do_query_expansion = st_config["do_query_expansion"].as_bool().unwrap_or(true);
         let attend_to_expansion_tokens = st_config["attend_to_expansion_tokens"]
             .as_bool()
             .unwrap_or(false);
@@ -56,9 +76,11 @@ impl ColBERT {
         Self::new(
             weights,
             dense_weights,
+            dense2_weights_opt,
             tokenizer,
             config,
             dense_config,
+            dense2_config_opt,
             query_prefix,
             document_prefix,
             mask_token,
@@ -74,7 +96,7 @@ impl ColBERT {
 
     /// WASM-compatible version of the `encode` method.
     #[wasm_bindgen(js_name = "encode")]
-    pub fn encode_wasm(&mut self, input: JsValue, is_query: bool) -> Result<JsValue, JsValue> {
+    pub fn encode_wasm(&mut self, input: JsValue, is_query: bool) -> Result<String, JsValue> {
         let params: EncodeInput = serde_wasm_bindgen::from_value(input)?;
         // Override model's batch_size if provided in the input
         if let Some(batch_size) = params.batch_size {
@@ -87,22 +109,27 @@ impl ColBERT {
         let result = EncodeOutput {
             embeddings: embeddings_data,
         };
-        serde_wasm_bindgen::to_value(&result).map_err(Into::into)
+        // Return as JSON string to avoid serde-wasm-bindgen issues
+        serde_json::to_string(&result)
+            .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
     }
 
     /// WASM-compatible version of the `similarity` method.
     #[wasm_bindgen(js_name = "similarity")]
-    pub fn similarity_wasm(&mut self, input: JsValue) -> Result<JsValue, JsValue> {
+    pub fn similarity_wasm(&mut self, input: JsValue) -> Result<String, JsValue> {
         let params: SimilarityInput = serde_wasm_bindgen::from_value(input)?;
         let queries_embeddings = self.encode(&params.queries, true)?;
         let documents_embeddings = self.encode(&params.documents, false)?;
         let result = self.similarity(&queries_embeddings, &documents_embeddings)?;
-        serde_wasm_bindgen::to_value(&result).map_err(Into::into)
+
+        // Return as JSON string to avoid serde-wasm-bindgen issues
+        serde_json::to_string(&result)
+            .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
     }
 
     /// WASM-compatible method to get the raw similarity matrix and tokens.
     #[wasm_bindgen(js_name = "raw_similarity_matrix")]
-    pub fn raw_similarity_matrix_wasm(&mut self, input: JsValue) -> Result<JsValue, JsValue> {
+    pub fn raw_similarity_matrix_wasm(&mut self, input: JsValue) -> Result<String, JsValue> {
         let params: SimilarityInput = serde_wasm_bindgen::from_value(input)?;
 
         let (query_ids_tensor, _, _) = self.tokenize(&params.queries, true)?;
@@ -151,7 +178,9 @@ impl ColBERT {
             document_tokens,
         };
 
-        serde_wasm_bindgen::to_value(&result).map_err(Into::into)
+        // Return as JSON string to avoid serde-wasm-bindgen issues
+        serde_json::to_string(&result)
+            .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
     }
 }
 
@@ -165,13 +194,14 @@ struct PoolingInput {
 /// WASM-compatible version of the `hierarchical_pooling` function.
 #[cfg(feature = "wasm")]
 #[wasm_bindgen(js_name = hierarchical_pooling)]
-pub fn hierarchical_pooling_wasm(input: JsValue) -> Result<JsValue, JsValue> {
+pub fn hierarchical_pooling_wasm(input: JsValue) -> Result<String, JsValue> {
     console_error_panic_hook::set_once();
     let params: PoolingInput = serde_wasm_bindgen::from_value(input)?;
 
     if params.embeddings.is_empty() {
         let result = EncodeOutput { embeddings: vec![] };
-        return serde_wasm_bindgen::to_value(&result).map_err(Into::into);
+        return serde_json::to_string(&result)
+            .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)));
     }
 
     let batch_size = params.embeddings.len();
@@ -181,7 +211,8 @@ pub fn hierarchical_pooling_wasm(input: JsValue) -> Result<JsValue, JsValue> {
         let result = EncodeOutput {
             embeddings: params.embeddings,
         };
-        return serde_wasm_bindgen::to_value(&result).map_err(Into::into);
+        return serde_json::to_string(&result)
+            .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)));
     }
     let embedding_dim = params.embeddings[0][0].len();
 
@@ -202,5 +233,7 @@ pub fn hierarchical_pooling_wasm(input: JsValue) -> Result<JsValue, JsValue> {
         embeddings: embeddings_data,
     };
 
-    serde_wasm_bindgen::to_value(&result).map_err(Into::into)
+    // Return as JSON string to avoid serde-wasm-bindgen issues
+    serde_json::to_string(&result)
+        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
 }

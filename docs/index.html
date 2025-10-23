@@ -892,6 +892,7 @@ print(scores)
                 "lightonai/GTE-ModernColBERT-v1",
                 "lightonai/colbertv2.0",
                 "lightonai/Reason-ModernColBERT",
+                "mixedbread-ai/mxbai-edge-colbert-v0-17m",
             ],
             REQUIRED_FILES: [
                 'tokenizer.json', 'model.safetensors', 'config.json',
@@ -1007,6 +1008,28 @@ print(scores)
             },
 
             /**
+             * Retry helper with exponential backoff
+             */
+            async retryWithBackoff(fn, maxRetries = 3, baseDelay = 100) {
+                for (let i = 0; i < maxRetries; i++) {
+                    try {
+                        return await fn();
+                    } catch (error) {
+                        const isLastAttempt = i === maxRetries - 1;
+                        const isTableGrowError = error.message && error.message.includes('Table.grow');
+
+                        if (isLastAttempt || !isTableGrowError) {
+                            throw error;
+                        }
+
+                        const delay = baseDelay * Math.pow(2, i);
+                        console.warn(`WASM init failed (attempt ${i + 1}/${maxRetries}), retrying in ${delay}ms...`, error.message);
+                        await new Promise(resolve => setTimeout(resolve, delay));
+                    }
+                }
+            },
+
+            /**
              * Initializes the application, sets up event listeners, and loads the initial model.
              */
             async init() {
@@ -1016,11 +1039,12 @@ print(scores)
                 hljs.highlightAll();
 
                 try {
-                    await init();
+                    await this.retryWithBackoff(() => init(), 5, 200);
+                    console.log("✅ WASM module initialized successfully");
                     this.loadModel(this.state.currentModelName);
                 } catch (e) {
-                    console.error("Fatal: Failed to initialize WASM module.", e);
-                    this.updateAllStatuses(`Error: Could not initialize the application.`, 'error');
+                    console.error("Fatal: Failed to initialize WASM module after retries.", e);
+                    this.updateAllStatuses(`Error: Could not initialize the application. Please refresh the page.`, 'error');
                 }
             },
 
@@ -1149,9 +1173,51 @@ print(scores)
                         console.warn(`Unable to download the model.`, e);
                     }
                     this.updateAllStatuses(`Initializing ${modelRepo}...`, 'loading');
-                    const [tokenizer, model, config, stConfig, dense, denseConfig, tokensConfig] = modelFiles;
-                    this.state.colbertModel = new ColBERT(model, dense, tokenizer, config, stConfig, denseConfig, tokensConfig, 32);
 
+                    // Try to fetch optional 2_Dense files
+                    let dense2 = null, dense2Config = null;
+                    try {
+                        const dense2Response = await fetch(`https://huggingface.co/${modelRepo}/resolve/main/2_Dense/model.safetensors`);
+                        const dense2ConfigResponse = await fetch(`https://huggingface.co/${modelRepo}/resolve/main/2_Dense/config.json`);
+                        if (dense2Response.ok && dense2ConfigResponse.ok) {
+                            dense2 = new Uint8Array(await dense2Response.arrayBuffer());
+                            dense2Config = new Uint8Array(await dense2ConfigResponse.arrayBuffer());
+                            console.log("✅ Found 2_Dense layer - will use full 2-stage projection");
+                        }
+                    } catch (e) {
+                        console.log("ℹ️ No 2_Dense layer found - using single Dense layer");
+                    }
+
+                    const [tokenizer, model, config, stConfig, dense, denseConfig, tokensConfig] = modelFiles;
+
+                    console.log("Creating ColBERT instance with:", {
+                        hasModel: !!model,
+                        hasDense: !!dense,
+                        hasDense2: !!dense2,
+                        hasTokenizer: !!tokenizer,
+                        hasConfig: !!config,
+                        hasStConfig: !!stConfig,
+                        hasDenseConfig: !!denseConfig,
+                        hasDense2Config: !!dense2Config,
+                        hasTokensConfig: !!tokensConfig
+                    });
+
+                    // New constructor signature: (weights, dense_weights, dense2_weights, tokenizer, config,
+                    //                             stConfig, dense_config, dense2_config, tokensConfig, batch_size)
+                    this.state.colbertModel = new ColBERT(
+                        model,
+                        dense,
+                        dense2,           // NEW: optional 2_Dense weights (can be null/undefined)
+                        tokenizer,
+                        config,
+                        stConfig,
+                        denseConfig,
+                        dense2Config,     // NEW: optional 2_Dense config (can be null/undefined)
+                        tokensConfig,
+                        32
+                    );
+
+                    console.log("✅ ColBERT instance created successfully");
                     this.updateAllStatuses(`✅ ${modelRepo} loaded successfully.`, 'success');
                     this.runAllDemos();
                 } catch (error) {
@@ -1167,15 +1233,34 @@ print(scores)
              * Runs all interactive demos after a model is loaded.
              */
             runAllDemos() {
-                this.handleSimilarityDemo();
-                this.handleMatrixDemo();
-                this.handlePoolingDemo();
+                if (!this.state.colbertModel) {
+                    console.warn("Model not loaded yet, skipping demos");
+                    return;
+                }
+
+                try {
+                    this.handleSimilarityDemo();
+                } catch (e) {
+                    console.error("Similarity demo failed:", e);
+                }
+
+                try {
+                    this.handleMatrixDemo();
+                } catch (e) {
+                    console.error("Matrix demo failed:", e);
+                }
+
+                try {
+                    this.handlePoolingDemo();
+                } catch (e) {
+                    console.error("Pooling demo failed:", e);
+                }
             },
 
             /**
              * SIMILARITY DEMO: Calculates and displays similarity scores.
              */
-            handleSimilarityDemo() {
+            async handleSimilarityDemo() {
                 if (!this.state.colbertModel) return;
                 const query = this.ui.queryInput.value;
                 const documents = this.ui.documentInput.value.split('\n').filter(doc => doc.trim());
@@ -1187,13 +1272,34 @@ print(scores)
                 }
 
                 try {
-                    const {
-                        data
-                    } = this.state.colbertModel.similarity({
+                    console.log("Running similarity with:", { query, documentsCount: documents.length });
+
+                    // Call the similarity method - now returns JSON string
+                    let resultString = this.state.colbertModel.similarity({
                         queries: [query],
                         documents
                     });
-                    const scores = data[0];
+
+                    console.log("Similarity result type:", typeof resultString);
+                    console.log("Similarity result string:", resultString);
+
+                    // Parse JSON string to object
+                    let result;
+                    if (typeof resultString === 'string') {
+                        result = JSON.parse(resultString);
+                    } else {
+                        result = resultString; // Fallback if it's already an object
+                    }
+
+                    console.log("Parsed result:", result);
+
+                    if (!result || !result.data || !result.data[0]) {
+                        console.error("Invalid similarity result:", result);
+                        this.ui.resultsList.innerHTML = `<p class="text-red-500 p-2">Error: Model returned invalid results. Check console for details.</p>`;
+                        return;
+                    }
+
+                    const scores = result.data[0];
                     const results = documents.map((doc, i) => ({
                         text: doc,
                         score: scores[i]
@@ -1238,10 +1344,11 @@ print(scores)
                 }
 
                 try {
-                    const rawResult = this.state.colbertModel.raw_similarity_matrix({
+                    const rawResultString = this.state.colbertModel.raw_similarity_matrix({
                         queries: [query],
                         documents: [doc]
                     });
+                    const rawResult = JSON.parse(rawResultString);
                     const {
                         matrix,
                         queryTokens,
@@ -1426,23 +1533,26 @@ print(scores)
                 }
 
                 try {
-                    const originalDocResult = this.state.colbertModel.encode({
+                    const originalDocResultString = this.state.colbertModel.encode({
                         sentences: [docText]
                     }, false);
+                    const originalDocResult = JSON.parse(originalDocResultString);
                     const originalDocEmbeddings = originalDocResult.embeddings[0] || [];
                     this.renderEmbeddingBlocks(this.ui.originalEmbeddingsVis, originalDocEmbeddings.length, this.ui.originalTokenCount);
 
-                    const pooledResult = hierarchical_pooling({
+                    const pooledResultString = hierarchical_pooling({
                         embeddings: [originalDocEmbeddings],
                         pool_factor: poolFactor
                     });
+                    const pooledResult = JSON.parse(pooledResultString);
                     const pooledDocEmbeddings = pooledResult.embeddings[0] || [];
                     this.renderEmbeddingBlocks(this.ui.pooledEmbeddingsVis, pooledDocEmbeddings.length, this.ui.pooledTokenCount);
 
                     if (queryText.trim()) {
-                        const queryResult = this.state.colbertModel.encode({
+                        const queryResultString = this.state.colbertModel.encode({
                             sentences: [queryText]
                         }, false);
+                        const queryResult = JSON.parse(queryResultString);
                         const queryEmbeddings = queryResult.embeddings[0] || [];
 
                         const calculateScore = (qVecs, dVecs) => {

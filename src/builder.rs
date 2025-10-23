@@ -111,8 +111,12 @@ impl TryFrom<ColbertBuilder> for ColBERT {
             st_config_path,
             dense_config_path,
             dense_weights_path,
+            dense2_config_path,
+            dense2_weights_path,
             special_tokens_map_path,
         ) = if local_path.is_dir() {
+            let dense2_config = local_path.join("2_Dense/config.json");
+            let dense2_weights = local_path.join("2_Dense/model.safetensors");
             (
                 local_path.join("tokenizer.json"),
                 local_path.join("model.safetensors"),
@@ -120,6 +124,16 @@ impl TryFrom<ColbertBuilder> for ColBERT {
                 local_path.join("config_sentence_transformers.json"),
                 local_path.join("1_Dense/config.json"),
                 local_path.join("1_Dense/model.safetensors"),
+                if dense2_config.exists() {
+                    Some(dense2_config)
+                } else {
+                    None
+                },
+                if dense2_weights.exists() {
+                    Some(dense2_weights)
+                } else {
+                    None
+                },
                 local_path.join("special_tokens_map.json"),
             )
         } else {
@@ -129,6 +143,8 @@ impl TryFrom<ColbertBuilder> for ColBERT {
                 RepoType::Model,
                 "main".to_string(),
             ));
+            let dense2_config = repo.get("2_Dense/config.json").ok();
+            let dense2_weights = repo.get("2_Dense/model.safetensors").ok();
             (
                 repo.get("tokenizer.json")?,
                 repo.get("model.safetensors")?,
@@ -136,6 +152,8 @@ impl TryFrom<ColbertBuilder> for ColBERT {
                 repo.get("config_sentence_transformers.json")?,
                 repo.get("1_Dense/config.json")?,
                 repo.get("1_Dense/model.safetensors")?,
+                dense2_config,
+                dense2_weights,
                 repo.get("special_tokens_map.json")?,
             )
         };
@@ -165,6 +183,11 @@ impl TryFrom<ColbertBuilder> for ColBERT {
         let st_config_bytes = fs::read(st_config_path)?;
         let dense_config_bytes = fs::read(dense_config_path)?;
         let dense_weights_bytes = fs::read(dense_weights_path)?;
+
+        // Read optional 2_Dense files if present
+        let dense2_config_bytes = dense2_config_path.map(|path| fs::read(path)).transpose()?;
+        let dense2_weights_bytes = dense2_weights_path.map(|path| fs::read(path)).transpose()?;
+
         let special_tokens_map_bytes = fs::read(special_tokens_map_path)?;
 
         let st_config: serde_json::Value = serde_json::from_slice(&st_config_bytes)?;
@@ -191,11 +214,9 @@ impl TryFrom<ColbertBuilder> for ColBERT {
                 .to_string()
         });
 
-        let final_do_query_expansion = builder.do_query_expansion.unwrap_or_else(|| {
-            st_config["do_query_expansion"]
-                .as_bool()
-                .unwrap_or(true)
-        });
+        let final_do_query_expansion = builder
+            .do_query_expansion
+            .unwrap_or_else(|| st_config["do_query_expansion"].as_bool().unwrap_or(true));
 
         let final_attend_to_expansion_tokens =
             builder.attend_to_expansion_tokens.unwrap_or_else(|| {
@@ -213,9 +234,11 @@ impl TryFrom<ColbertBuilder> for ColBERT {
         ColBERT::new(
             weights_bytes,
             dense_weights_bytes,
+            dense2_weights_bytes,
             tokenizer_bytes,
             config_bytes,
             dense_config_bytes,
+            dense2_config_bytes,
             final_query_prefix,
             final_document_prefix,
             mask_token,
